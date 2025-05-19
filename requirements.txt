@@ -1,0 +1,20 @@
+# FastAPI and related
+fastapi==0.104.1
+uvicorn[standard]==0.23.2
+pydantic==2.5.2
+
+# Logging
+loguru==0.7.2
+
+# Data manipulation and numerical operations
+numpy==1.26.0
+pandas==2.0.3
+
+# Time series analysis (includes scipy as a dependency)
+statsmodels==0.14.1 # Or a more recent stable version like 0.14.x
+
+# Scipy is often a dependency of pandas/statsmodels, 
+# but pinning it can ensure consistency if needed.
+# If you encounter issues, you can try uncommenting and pinning it
+# to match the version used in your pretrainer.
+# scipy==1.11.4 
