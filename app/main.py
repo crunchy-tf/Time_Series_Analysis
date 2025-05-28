@@ -1,66 +1,60 @@
 # time_series_analysis_service/app/main.py
-from fastapi import FastAPI, HTTPException, Depends, status # Added Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status 
 from loguru import logger
 import sys
-import asyncio # Added
-from contextlib import asynccontextmanager # Added
+import asyncio 
+from contextlib import asynccontextmanager 
 
-from app.models import AnalysisRequest, AnalysisResponse, TimeSeriesData, TimePoint, AnalysisType # Added AnalysisType
-from app.config import settings # Use Pydantic settings
+from app.models import AnalysisRequest, AnalysisResponse, TimeSeriesData, TimePoint, AnalysisType 
+from app.config import settings 
 from app.services import basic_analyzer, advanced_analyzer
-# Import real DB connector and new store function
 from app.db_connector.ts_db_connector import (
     connect_db as connect_ts_db, 
     close_db as close_ts_db,
-    fetch_time_series_data, # This will now be the real one
-    store_analysis_result   # New function to store results
+    fetch_time_series_data, 
+    store_analysis_result   
 )
+# --- IMPORT CORRECT SCHEDULER FUNCTIONS ---
+from app.services.scheduler_service import start_ts_analysis_scheduler, stop_ts_analysis_scheduler
 
 logger.remove()
-logger.add(sys.stderr, level=settings.LOG_LEVEL.upper()) # Use settings
+logger.add(sys.stderr, level=settings.LOG_LEVEL.upper()) 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"{settings.SERVICE_NAME} starting up...")
     try:
-        await connect_ts_db() # Connect to TimescaleDB
+        await connect_ts_db() 
     except Exception as e:
         logger.critical(f"TimescaleDB connection failed during startup: {e}", exc_info=True)
-        # Attempt cleanup before raising
-        try:
-            await close_ts_db()
-        except Exception as close_e:
-            logger.error(f"Error during TimescaleDB cleanup after connection failure: {close_e}")
+        try: await close_ts_db()
+        except Exception as close_e: logger.error(f"Error during DB cleanup: {close_e}")
         raise RuntimeError(f"TimescaleDB connection failed: {e}") from e
     
-    # Add scheduler startup here if you implement a scheduled analysis job later
-    # try:
-    #     await start_ts_analysis_scheduler() 
-    # except Exception as e:
-    #     logger.error(f"APScheduler for Time Series Analysis failed to start: {e}", exc_info=True)
-    #     # Decide if this is fatal
+    try:
+        await start_ts_analysis_scheduler() # Correct function name
+    except Exception as e:
+        logger.error(f"APScheduler for Time Series Analysis failed to start: {e}", exc_info=True)
+        # Optionally, make this fatal by re-raising or exiting
 
     logger.info(f"{settings.SERVICE_NAME} startup complete.")
     yield
     logger.info(f"{settings.SERVICE_NAME} shutting down...")
-    # await stop_ts_analysis_scheduler() # If scheduler added
+    await stop_ts_analysis_scheduler() # Correct function name
     await close_ts_db()
-    logger.info("TimescaleDB connection shut down.")
+    logger.info("Scheduler and TimescaleDB connection shut down.") 
     logger.info(f"{settings.SERVICE_NAME} shutdown complete.")
 
 app = FastAPI(
-    title=settings.SERVICE_NAME, # Use settings
+    title=settings.SERVICE_NAME, 
     description="Applies statistical models and analyses to time-series data.",
     version="1.0.0",
     lifespan=lifespan
 )
 
-# No longer using mock_fetch directly in the endpoint
-# async def get_input_timeseries(request: AnalysisRequest) -> TimeSeriesData: ... (see below)
-
 @app.post("/analyze", response_model=AnalysisResponse, summary="Perform Time Series Analysis")
 async def analyze_time_series_endpoint(request: AnalysisRequest):
-    logger.info(f"Received request for {request.analysis_type.value} on signal '{request.signal_name or 'provided_data'}'")
+    logger.info(f"Received API request for {request.analysis_type.value} on signal '{request.signal_name or 'provided_data'}'")
 
     input_ts_data: Optional[TimeSeriesData] = None
     effective_signal_name: str
@@ -72,44 +66,38 @@ async def analyze_time_series_endpoint(request: AnalysisRequest):
             effective_signal_name = input_ts_data.signal_name
         elif request.signal_name and request.start_time and request.end_time:
             logger.info(f"Fetching time series data for signal: {request.signal_name} from DB.")
-            # Determine metric column and topic_id if signal_name is structured e.g., "topic_123_document_count"
-            # This is a simplification; you might need more robust parsing or explicit params
+            
             parts = request.signal_name.split('_')
             topic_id_filter = None
-            metric_to_fetch = "value" # Default if not parsed, or you pass it in request.parameters
-
-            if len(parts) >= 3 and parts[0] == "topic": # e.g. topic_someid_metric
+            # Default metric_to_fetch; the API parameter `metric_column_to_analyze` takes precedence if provided
+            metric_to_fetch_default = "document_count" 
+            
+            if len(parts) >= 2 and parts[0] == "topic": # e.g. topic_123 OR topic_123_some_metric
                 topic_id_filter = parts[1]
-                metric_to_fetch = "_".join(parts[2:])
-                # Check if metric_to_fetch is a valid column name in the source signal table
-                # For now, we assume it is, or fetch_time_series_data handles this.
-            elif len(parts) == 2 and parts[0] == "topic": # e.g. topic_someid -> implies a default metric like document_count
-                 topic_id_filter = parts[1]
-                 metric_to_fetch = "document_count" # Default metric for a topic
-            else: # Treat signal_name as a direct identifier for a simple series or a pre-defined composite
-                logger.debug(f"Signal name '{request.signal_name}' not in 'topic_id_metric' format. Assuming it's a direct signal name or fetching default metric.")
-                # fetch_time_series_data needs to know how to interpret this generic signal_name
+                if len(parts) >= 3: # topic_123_some_metric
+                    metric_to_fetch_default = "_".join(parts[2:])
+            
+            metric_column_final = request.parameters.get("metric_column_to_analyze", metric_to_fetch_default)
 
             input_ts_data = await fetch_time_series_data(
-                signal_name=request.signal_name, # Pass the original requested name
-                topic_id=topic_id_filter,          # Pass parsed topic_id if available
-                metric_column=request.parameters.get("metric_column_to_analyze", metric_to_fetch), # Allow override
+                signal_name=request.signal_name, 
+                topic_id=topic_id_filter,          
+                metric_column=metric_column_final, 
                 start_time=request.start_time,
                 end_time=request.end_time
             )
             if not input_ts_data or not input_ts_data.points:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Time series data not found for signal: {request.signal_name} in the given range.")
-            effective_signal_name = input_ts_data.signal_name # Use the name from the fetched data
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Time series data not found for signal: {request.signal_name} (metric: {metric_column_final}, topic: {topic_id_filter}) in the given range.")
+            effective_signal_name = input_ts_data.signal_name 
         else:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Insufficient parameters to fetch or use time series data.")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Insufficient parameters: provide time_series_data or (signal_name, start_time, end_time).")
 
-        
         result_data: Any = None 
         result_metadata = input_ts_data.metadata.copy() if input_ts_data.metadata else {}
         result_metadata["original_request_signal_name"] = request.signal_name or "provided_data"
+        result_metadata["analysis_source"] = "api_call"
 
 
-        # --- Analysis Logic (calls to basic_analyzer, advanced_analyzer) ---
         if request.analysis_type == AnalysisType.BASIC_STATS:
             result_data = basic_analyzer.calculate_basic_stats(input_ts_data)
             result_metadata["description"] = "Basic descriptive statistics"
@@ -134,26 +122,24 @@ async def analyze_time_series_endpoint(request: AnalysisRequest):
             period = request.parameters.get("period", settings.DEFAULT_STL_PERIOD)
             robust = request.parameters.get("robust", True)
             result_data = advanced_analyzer.perform_stl_decomposition(input_ts_data, period=period, robust=robust)
-            if result_data: result_metadata["description"] = f"STL Decomposition (period used: {result_data.period_used if result_data else 'N/A'})" # Guard against None
+            if result_data and result_data.period_used is not None : result_metadata["description"] = f"STL Decomposition (period used: {result_data.period_used})"
         else:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsupported analysis_type: {request.analysis_type.value}")
 
         if result_data is None:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Could not compute {request.analysis_type.value}, possibly due to insufficient or unsuitable data for signal '{effective_signal_name}'.")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Could not compute {request.analysis_type.value} for signal '{effective_signal_name}'.")
 
-        # --- Store Analysis Result ---
         try:
             await store_analysis_result(
-                original_signal_name=effective_signal_name, # Name of the signal that was analyzed
+                original_signal_name=effective_signal_name, 
                 analysis_type=request.analysis_type,
                 parameters=request.parameters,
-                result_data=result_data, # The actual Pydantic model of the result
+                result_data=result_data, 
                 result_metadata=result_metadata
             )
-            logger.info(f"Analysis result for '{effective_signal_name}' (type: {request.analysis_type.value}) stored.")
+            logger.info(f"API Analysis result for '{effective_signal_name}' (type: {request.analysis_type.value}) stored.")
         except Exception as db_store_err:
-            logger.error(f"Failed to store analysis result for '{effective_signal_name}': {db_store_err}", exc_info=True)
-            # Decide if API call should fail if storage fails. For now, return result.
+            logger.error(f"Failed to store API analysis result for '{effective_signal_name}': {db_store_err}", exc_info=True)
 
         return AnalysisResponse(
             requested_signal_name=effective_signal_name,
@@ -162,27 +148,12 @@ async def analyze_time_series_endpoint(request: AnalysisRequest):
             result=result_data,
             result_metadata=result_metadata
         )
-
-    except HTTPException as http_exc:
-        raise http_exc
+    except HTTPException as http_exc: raise http_exc
     except Exception as e:
-        logger.error(f"Error processing analysis request for signal '{request.signal_name or 'provided_data'}': {e}", exc_info=True)
+        logger.error(f"Error processing API analysis request for signal '{request.signal_name or 'provided_data'}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error during time series analysis.")
-
 
 if __name__ == "__main__":
     import uvicorn
-    # The mock_fetch override is removed as we intend to use the real DB connector.
-    # For isolated local testing of just the API/logic without a live DB, you could re-add it.
-    
-    logger.info(f"Starting {settings.SERVICE_NAME} for local development on port 8003...")
-    service_port = 8003 # Matching Dockerfile
-    # try: service_port = settings.SERVICE_PORT # If you add SERVICE_PORT to settings
-    # except AttributeError: pass
-    uvicorn.run(
-        "app.main:app", 
-        host="0.0.0.0", 
-        port=service_port, 
-        log_level=settings.LOG_LEVEL.lower(), 
-        reload=True
-    )
+    service_port = 8003 
+    uvicorn.run( "app.main:app", host="0.0.0.0", port=service_port, log_level=settings.LOG_LEVEL.lower(), reload=True)
