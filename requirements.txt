@@ -1,16 +1,21 @@
-# FastAPI and related
-fastapi==0.104.1
-uvicorn[standard]==0.23.2
-pydantic==2.5.2
+fastapi>=0.104.1
+uvicorn[standard]>=0.23.2
+loguru>=0.7.2
+pydantic>=2.5.2
+pydantic-settings==2.2.1 # <-- ADD THIS LINE
+numpy>=1.26.0
 
-# Logging
-loguru==0.7.2
+# --- Database Connector ---
+asyncpg>=0.27.0
+
+# --- Scheduler ---
+apscheduler>=3.10.4
+
+# --- For calling Keyword Manager API ---
+httpx>=0.25.0 # Not actually used in the current TSA service code, but in requirements
 
 # Data manipulation and numerical operations
-numpy==1.26.0
 pandas==2.0.3
 
 # Time series analysis (includes scipy as a dependency)
-statsmodels==0.14.1 # Or a more recent stable version like 0.14.x
-
-# scipy==1.11.4 
+statsmodels==0.14.1
