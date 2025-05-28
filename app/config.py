@@ -3,7 +3,10 @@ from typing import List, Optional, Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator
 from loguru import logger
-import json # For TSA_SCHEDULED_ANALYSES validator
+import json 
+
+# Import your AnalysisType enum to easily define the default
+from app.models import AnalysisType # Make sure this path is correct for your models.py
 
 class Settings(BaseSettings):
     SERVICE_NAME: str = "Minbar Time Series Analysis Service"
@@ -29,9 +32,14 @@ class Settings(BaseSettings):
     # --- Scheduler settings for Time Series Analysis ---
     # Maps to SCHEDULER_INTERVAL_MINUTES_TSA in .env if you use that, or SCHEDULER_INTERVAL_MINUTES
     SCHEDULER_INTERVAL_MINUTES: int = Field(default=60, gt=0, validation_alias='SCHEDULER_INTERVAL_MINUTES_TSA')
-    TSA_SCHEDULER_BATCH_SIZE: int = Field(default=10, gt=0)
-    TSA_SCHEDULER_LOOKBACK_DAYS: int = Field(default=90, gt=0)
-    TSA_SCHEDULED_ANALYSES: List[str] = Field(default_factory=lambda: ["moving_average", "z_score"])
+    TSA_SCHEDULER_BATCH_SIZE: int = Field(default=10, gt=0, description="Number of distinct signals (topic_id/metric) to process per scheduler run")
+    TSA_SCHEDULER_LOOKBACK_DAYS: int = Field(default=30, gt=0, description="How many days back to fetch data for scheduled analysis")
+    
+    # --- MODIFIED DEFAULT FOR TSA_SCHEDULED_ANALYSES ---
+    TSA_SCHEDULED_ANALYSES: List[str] = Field(
+        default_factory=lambda: [analysis.value for analysis in AnalysisType] # Use all enum members
+    )
+    # --- END MODIFICATION ---
 
 
     @property
@@ -59,38 +67,47 @@ class Settings(BaseSettings):
     @field_validator('TSA_SCHEDULED_ANALYSES', mode='before')
     @classmethod
     def parse_scheduled_analyses_from_env(cls, v: Any) -> List[str]:
-        default_analyses = ["moving_average", "z_score"]
+        # Default if parsing from .env fails or if .env value is invalid/empty
+        default_analyses_all = [analysis.value for analysis in AnalysisType]
+        
         if isinstance(v, list):
-            # Ensure all items are strings
             if all(isinstance(item, str) for item in v):
-                return v
+                valid_types = [at.value for at in AnalysisType]
+                validated_list = [item for item in v if item in valid_types]
+                if len(validated_list) != len(v):
+                    logger.warning(f"TSA_SCHEDULED_ANALYSES list from env contains invalid AnalysisTypes. Using only valid ones or default (all).")
+                    return validated_list if validated_list else default_analyses_all
+                return validated_list
             else:
-                logger.warning(f"TSA_SCHEDULED_ANALYSES list contains non-string items. Using default: {default_analyses}")
-                return default_analyses
+                logger.warning(f"TSA_SCHEDULED_ANALYSES list from env non-string. Using default (all): {default_analyses_all}")
+                return default_analyses_all
         if isinstance(v, str):
-            if not v.strip(): # Empty string in env
-                logger.info(f"TSA_SCHEDULED_ANALYSES is empty string in env. Using default: {default_analyses}")
-                return default_analyses
+            if not v.strip():
+                logger.debug(f"TSA_SCHEDULED_ANALYSES is empty string in env. Using default (all): {default_analyses_all}")
+                return default_analyses_all
             try:
                 parsed_list = json.loads(v)
                 if isinstance(parsed_list, list) and all(isinstance(item, str) for item in parsed_list):
-                    return parsed_list
+                    valid_types = [at.value for at in AnalysisType]
+                    validated_list = [item for item in parsed_list if item in valid_types]
+                    if len(validated_list) != len(parsed_list):
+                        logger.warning(f"TSA_SCHEDULED_ANALYSES JSON from env invalid AnalysisTypes. Using only valid ones or default (all).")
+                        return validated_list if validated_list else default_analyses_all
+                    return validated_list
                 else:
-                    logger.warning(f"TSA_SCHEDULED_ANALYSES from env ('{v}') is not a valid JSON list of strings. Using default: {default_analyses}")
-                    return default_analyses
+                    logger.warning(f"TSA_SCHEDULED_ANALYSES from env ('{v}') not valid JSON list of strings. Using default (all): {default_analyses_all}")
+                    return default_analyses_all
             except json.JSONDecodeError:
-                logger.warning(f"Could not parse TSA_SCHEDULED_ANALYSES JSON string from env: '{v}'. Using default: {default_analyses}")
-                return default_analyses
+                logger.warning(f"Could not parse TSA_SCHEDULED_ANALYSES JSON from env: '{v}'. Using default (all): {default_analyses_all}")
+                return default_analyses_all
         
-        # Fallback if type is unexpected or if it's None and default_factory didn't catch it (shouldn't happen with default_factory)
-        logger.warning(f"TSA_SCHEDULED_ANALYSES has unexpected type or value: {type(v)}. Using default: {default_analyses}")
-        return default_analyses
+        logger.debug(f"TSA_SCHEDULED_ANALYSES not explicitly set or invalid type in env. Using default (all): {default_analyses_all}")
+        return default_analyses_all
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 settings = Settings()
 
-# For modules that might import these directly (though settings.FIELD is preferred)
 LOG_LEVEL = settings.LOG_LEVEL
 DEFAULT_MOVING_AVERAGE_WINDOW = settings.DEFAULT_MOVING_AVERAGE_WINDOW
 DEFAULT_ROC_PERIOD = settings.DEFAULT_ROC_PERIOD

@@ -1,7 +1,7 @@
 # time_series_analysis_service/app/db_connector/ts_db_connector.py
 import asyncpg
-from datetime import datetime, timezone, timedelta # Added timedelta
-from typing import Optional, List, Dict, Any, Tuple # Added Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Dict, Any, Tuple
 from loguru import logger
 import json 
 
@@ -103,11 +103,10 @@ async def fetch_time_series_data(
     
     logger.info(f"Fetching data for signal '{signal_name}' (metric: {metric_column} from table {source_table_name}, topic: {topic_id}) from {start_time} to {end_time}.")
 
-    query_conditions = ["signal_timestamp >= $1", "signal_timestamp < $2"] # Use < $2 for exclusive end
+    query_conditions = ["signal_timestamp >= $1", "signal_timestamp < $2"] 
     query_params: list = [start_time, end_time]
     
     actual_topic_id = topic_id
-    # This logic is for when the API endpoint calls, scheduler logic might be more direct
     if actual_topic_id is None and "topic_" in signal_name: 
         parts = signal_name.split("_")
         if parts[0] == "topic" and len(parts) >= 2:
@@ -171,7 +170,7 @@ async def store_analysis_result(
     original_signal_name: str, 
     analysis_type: AnalysisType, 
     parameters: Dict[str, Any],
-    result_data: AnalysisResultData,
+    result_data: AnalysisResultData, # This is the Union type
     result_metadata: Optional[Dict[str, Any]] = None
 ):
     pool = await get_pool()
@@ -179,41 +178,49 @@ async def store_analysis_result(
     
     await _ensure_analysis_results_table_exists(table_name)
     
-    record_to_insert = {
-        "analysis_timestamp": datetime.now(timezone.utc),
-        "original_signal_name": original_signal_name,
-        "analysis_type": analysis_type.value,
-        "parameters": json.dumps(parameters) if parameters else None,
-        "result_value_numeric": None,
-        "result_series_jsonb": None,
-        "result_structured_jsonb": None,
-        "metadata": json.dumps(result_metadata) if result_metadata else None
-    }
+    # Initialize with None for JSONB fields
+    result_value_numeric_val = None
+    result_series_jsonb_val = None
+    result_structured_jsonb_val = None
 
+    # --- REVISED LOGIC FOR PREPARING JSONB FIELDS ---
     if isinstance(result_data, BasicStatsResult):
-        record_to_insert["result_structured_jsonb"] = json.dumps(result_data.model_dump())
+        result_structured_jsonb_val = result_data.model_dump_json()
     elif isinstance(result_data, MovingAverageResult):
-        record_to_insert["result_series_jsonb"] = json.dumps(result_data.moving_average_signal.model_dump())
+        result_series_jsonb_val = result_data.moving_average_signal.model_dump_json()
     elif isinstance(result_data, ZScoreResult):
-        record_to_insert["result_structured_jsonb"] = json.dumps(result_data.model_dump(exclude_none=True))
+        result_structured_jsonb_val = result_data.model_dump_json()
     elif isinstance(result_data, STLDecompositionResult):
-        dumpable_stl = result_data.model_dump(exclude_none=True)
-        # Pydantic v2: .model_dump() handles datetimes to isoformat by default if configured in model,
-        # otherwise ensure manual conversion if needed for JSON serialization
-        if 'original_timestamps' in dumpable_stl and isinstance(dumpable_stl['original_timestamps'], list):
-             dumpable_stl["original_timestamps"] = [ts.isoformat() if isinstance(ts, datetime) else ts for ts in dumpable_stl['original_timestamps']]
-        record_to_insert["result_structured_jsonb"] = json.dumps(dumpable_stl)
-    elif isinstance(result_data, TimeSeriesData):
-        record_to_insert["result_series_jsonb"] = json.dumps(result_data.model_dump())
+        result_structured_jsonb_val = result_data.model_dump_json()
+    elif isinstance(result_data, TimeSeriesData): # For ROC, PercentChange
+        result_series_jsonb_val = result_data.model_dump_json()
+    elif isinstance(result_data, (int, float)): # For single numeric results if ever needed
+        result_value_numeric_val = float(result_data)
     else:
-        logger.warning(f"Unhandled result_data type for storage: {type(result_data)}")
+        logger.warning(f"Unhandled result_data type for storage: {type(result_data)}. Attempting generic dump.")
         try:
-            record_to_insert["result_structured_jsonb"] = json.dumps(result_data) 
+            # If result_data is a simple dict/list not needing Pydantic's datetime handling
+            result_structured_jsonb_val = json.dumps(result_data)
         except TypeError:
-            logger.error(f"Could not serialize result_data of type {type(result_data)} to JSON.")
-            return
+            logger.error(f"Could not serialize result_data of type {type(result_data)} to JSON directly.")
+            return # Or raise an error / handle differently
 
-    cols = list(record_to_insert.keys())
+    record_to_insert_values = [
+        datetime.now(timezone.utc),
+        original_signal_name,
+        analysis_type.value,
+        json.dumps(parameters) if parameters else None,
+        result_value_numeric_val,
+        result_series_jsonb_val,      # This is now a JSON string or None
+        result_structured_jsonb_val,  # This is now a JSON string or None
+        json.dumps(result_metadata) if result_metadata else None
+    ]
+    # --- END REVISED LOGIC ---
+
+    cols = [
+        "analysis_timestamp", "original_signal_name", "analysis_type", "parameters",
+        "result_value_numeric", "result_series_jsonb", "result_structured_jsonb", "metadata"
+    ]
     vals_placeholders = ", ".join([f"${i+1}" for i in range(len(cols))])
     conflict_target = "(original_signal_name, analysis_type, analysis_timestamp)" 
     update_setters = ", ".join([f"\"{col}\" = EXCLUDED.\"{col}\"" for col in cols if col not in ["original_signal_name", "analysis_type", "analysis_timestamp"]])
@@ -226,38 +233,23 @@ async def store_analysis_result(
     
     try:
         async with pool.acquire() as conn:
-            await conn.execute(insert_query, *record_to_insert.values())
+            await conn.execute(insert_query, *record_to_insert_values)
         logger.info(f"Stored/Updated analysis result for '{original_signal_name}', type '{analysis_type.value}' in '{table_name}'.")
     except Exception as e:
         logger.error(f"Error storing analysis result in '{table_name}': {e}", exc_info=True)
 
-# --- NEW FUNCTIONS FOR SCHEDULER ---
 async def get_distinct_topic_signals_to_analyze(limit: int) -> List[Tuple[str, str]]:
-    """
-    Fetches distinct topic_ids from the source signals table.
-    The associated metric to analyze for these topics is assumed to be 'document_count'
-    by the calling function (main_processor.py) for this iteration.
-    Returns a list of tuples: (topic_id_as_string, metric_name_to_analyze)
-    """
     pool = await get_pool()
-    source_table = f"{settings.SOURCE_SIGNALS_TABLE_PREFIX}_topic_hourly" # Source table
-    
-    # We only want topic_ids that have actual data.
-    # We also want to avoid analyzing the outlier topic (-1) too proactively unless specified.
+    source_table = f"{settings.SOURCE_SIGNALS_TABLE_PREFIX}_topic_hourly"
     query = f"""
         SELECT DISTINCT topic_id
         FROM "{source_table}"
-        WHERE topic_id IS NOT NULL 
-          AND topic_id != '-1' -- Optionally exclude outlier, or make this configurable
-          -- AND document_count IS NOT NULL AND document_count > 0 -- Ensure there's data to analyze for this metric
-        ORDER BY topic_id -- Or by MAX(signal_timestamp) DESC if you want freshest topics
+        WHERE topic_id IS NOT NULL AND topic_id != '-1'
+        ORDER BY topic_id 
         LIMIT $1;
     """
     try:
         records = await pool.fetch(query, limit)
-        # Each record will have a 'topic_id' field.
-        # The "signal_name_identifier" will be "topic_{topic_id}"
-        # The metric to analyze will be "document_count" by default for scheduled runs.
         distinct_signals = [(str(record['topic_id']), "document_count") for record in records]
         logger.info(f"Found {len(distinct_signals)} distinct topic signals (metric: document_count) for scheduled analysis.")
         return distinct_signals
@@ -269,14 +261,8 @@ async def get_distinct_topic_signals_to_analyze(limit: int) -> List[Tuple[str, s
         return []
 
 async def get_latest_analysis_timestamp(original_signal_name: str, analysis_type_str: str) -> Optional[datetime]:
-    """
-    Checks the latest analysis_timestamp for a given signal and analysis type
-    in the corresponding analysis_results table.
-    analysis_type_str is the string value of the AnalysisType enum.
-    """
     pool = await get_pool()
     results_table_name = f"{settings.ANALYSIS_RESULTS_TABLE_PREFIX}_{analysis_type_str.lower()}"
-    
     try:
         async with pool.acquire() as conn:
             table_exists = await conn.fetchval(
@@ -289,7 +275,6 @@ async def get_latest_analysis_timestamp(original_signal_name: str, analysis_type
     except Exception as e:
         logger.error(f"Error checking existence of table '{results_table_name}': {e}")
         return None 
-
     query = f"""
         SELECT MAX(analysis_timestamp) 
         FROM "{results_table_name}"
@@ -305,4 +290,3 @@ async def get_latest_analysis_timestamp(original_signal_name: str, analysis_type
     except Exception as e:
         logger.error(f"Error fetching latest analysis timestamp for '{original_signal_name}' (type: {analysis_type_str}): {e}", exc_info=True)
         return None
-# --- END NEW FUNCTIONS ---
